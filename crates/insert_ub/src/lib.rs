@@ -1,38 +1,49 @@
 pub mod cli;
+mod ub;
 
 use ast::types::{DataType, MemoryViewType, ScalarType};
 use ast::*;
+use std::rc::Rc;
+use ub::generate_ub;
 
 // May need more up here basing this off
 // of the reconditioner
 
 #[derive(Default)]
-pub struct Options; // No opts yet
-
-pub fn flow(ast: Module) -> Module {
-    flow_with(ast, Options::default())
+pub struct Options {
+    blocks: Vec<u32>,
 }
 
-pub fn flow_with(mut ast: Module, options: Options) -> Module {
-    eprintln!("Creating flow");
-    let mut flow = Flow::new(options);
-    eprintln!("Flow created");
+pub fn insert_ub(mut ast: Module, flow: Vec<u32>, size: usize) -> Module {
+    let mut inserter = UBInserter::new(Options { blocks: flow });
 
-    ast.functions = ast
-        .functions
-        .into_iter()
-        .map(|f| flow.analyze_fn(f))
-        .collect::<Vec<_>>();
-
-    let flow_struct = StructDecl::new(
-        "_WGSLSmithFlow",
-        vec![StructMember::new(
-            vec![],
-            "block".to_string(),
-            DataType::array(DataType::Scalar(ScalarType::U32), Some(flow.block_count)),
-        )],
+    let ub_struct = StructDecl::new(
+        "_WGSLSmithUB",
+        vec![
+            StructMember::new(
+                vec![],
+                "min_index".to_string(),
+                DataType::Scalar(ScalarType::U32),
+            ),
+            StructMember::new(
+                vec![],
+                "max_index".to_string(),
+                DataType::Scalar(ScalarType::U32),
+            ),
+            StructMember::new(
+                vec![],
+                "write_value".to_string(),
+                DataType::Scalar(ScalarType::U32),
+            ),
+            StructMember::new(
+                vec![],
+                "arr".to_string(),
+                DataType::Array(Rc::new(DataType::Scalar(ScalarType::U32)), Some((size / 4) as u32)),
+            ),
+        ],
     );
-    ast.structs.push(flow_struct.clone());
+
+    ast.structs.push(ub_struct.clone());
 
     // largest binding number
     let max_binding = ast
@@ -57,50 +68,51 @@ pub fn flow_with(mut ast: Module, options: Options) -> Module {
             storage_class: StorageClass::Storage,
             access_mode: Some(AccessMode::ReadWrite),
         }),
-        name: "_wgslsmith_flow".to_string(),
-        data_type: DataType::Struct(flow_struct),
+        name: "_wgslsmith_ub".to_string(),
+        data_type: DataType::Struct(ub_struct),
         initializer: None,
     });
+
+    ast.functions = ast
+        .functions
+        .into_iter()
+        .map(|f| inserter.analyze_fn(f))
+        .collect::<Vec<_>>();
+
     // check the reconditioner here
 
     ast
 }
 
 // May be more to keep in the state
-struct Flow {
+struct UBInserter {
     block_count: u32,
+    blocks: Vec<u32>,
 }
 
-impl Flow {
-    fn new(options: Options) -> Flow {
-        Flow { block_count: 0 }
+impl UBInserter {
+    fn new(options: Options) -> UBInserter {
+        UBInserter {
+            block_count: 0,
+            blocks: options.blocks,
+        }
     }
 
-    fn build_assign(&mut self) -> Statement {
-        // We will use an i32 array so we can see overflow
-        // TODO: Check if uniform is correct
-        let lhs = AssignmentLhs::array_index(
-            "_wgslsmith_flow.block",
-            DataType::Ref(MemoryViewType::new(
-                DataType::array(ScalarType::U32, None),
-                StorageClass::Uniform,
-            )),
-            ExprNode::from(Lit::U32(self.block_count.try_into().unwrap())),
-        );
-        // Create lhs here which is an assignment with the struct flow, member block
-        let op = AssignmentOp::Plus;
-        let rhs = ExprNode::from(Lit::U32(1)); // set the flow to true since we visited
-        let assign = AssignmentStatement::new(lhs, op, rhs);
-
+    fn build_assign(&mut self) -> Option<Statement> {
+        if self.blocks[self.block_count as usize] == 0 {
+            self.block_count += 1;
+            return None;
+        }
         self.block_count += 1;
-
-        Statement::Assignment(assign)
+        Some(generate_ub().into())
     }
 
     fn analyze_fn(&mut self, mut decl: FnDecl) -> FnDecl {
         // Insert the assignment at the beginning of a function
         if !decl.name.starts_with("_wgslsmith_") {
-            decl.body.insert(0, self.build_assign());
+            if let Some(insertion) = self.build_assign() {
+                decl.body.insert(0, insertion.into());
+            }
         }
 
         decl.body = decl
@@ -108,8 +120,6 @@ impl Flow {
             .into_iter()
             .map(|s| self.analyze_stmt(s))
             .collect();
-
-        // TODO: add in the recursive calls to analyze stmt
 
         decl
     }
@@ -123,10 +133,11 @@ impl Flow {
             }) => {
                 let mod_body: Vec<Statement> =
                     body.into_iter().map(|s| self.analyze_stmt(s)).collect();
-                let new_body = vec![Statement::Compound(vec![
-                    self.build_assign().into(),
-                    mod_body.into(),
-                ])];
+                let new_body = if let Some(insertion) = self.build_assign() {
+                    vec![Statement::Compound(vec![insertion.into(), mod_body.into()])]
+                } else {
+                    mod_body
+                };
                 Else::If(IfStatement {
                     condition,
                     body: new_body,
@@ -134,7 +145,9 @@ impl Flow {
                 })
             }
             Else::Else(mut stmts) => {
-                stmts.insert(0, self.build_assign());
+                if let Some(insertion) = self.build_assign() {
+                    stmts.insert(0, insertion);
+                }
 
                 Else::Else(stmts.into_iter().map(|s| self.analyze_stmt(s)).collect())
             }
@@ -152,10 +165,11 @@ impl Flow {
             }) => {
                 let mod_body: Vec<Statement> =
                     body.into_iter().map(|s| self.analyze_stmt(s)).collect();
-                let new_body = vec![Statement::Compound(vec![
-                    self.build_assign().into(),
-                    mod_body.into(),
-                ])];
+                let new_body = if let Some(insertion) = self.build_assign() {
+                    vec![Statement::Compound(vec![insertion.into(), mod_body.into()])]
+                } else {
+                    mod_body
+                };
                 IfStatement::new(condition, new_body)
                     .with_else(else_.map(|els| self.analyze_else(*els)))
                     .into()
@@ -163,10 +177,11 @@ impl Flow {
             Statement::Loop(LoopStatement { body }) => {
                 let mod_body: Vec<Statement> =
                     body.into_iter().map(|s| self.analyze_stmt(s)).collect();
-                let new_body = vec![Statement::Compound(vec![
-                    self.build_assign().into(),
-                    mod_body.into(),
-                ])];
+                let new_body = if let Some(insertion) = self.build_assign() {
+                    vec![Statement::Compound(vec![insertion.into(), mod_body.into()])]
+                } else {
+                    mod_body
+                };
                 LoopStatement::new(new_body).into()
             }
             Statement::Break => Statement::Break,
@@ -180,10 +195,11 @@ impl Flow {
                     .map(|SwitchCase { selector, body }| {
                         let mod_body: Vec<Statement> =
                             body.into_iter().map(|it| self.analyze_stmt(it)).collect();
-                        let new_body = vec![Statement::Compound(vec![
-                            self.build_assign().into(),
-                            mod_body.into(),
-                        ])];
+                        let new_body = if let Some(insertion) = self.build_assign() {
+                            vec![Statement::Compound(vec![insertion.into(), mod_body.into()])]
+                        } else {
+                            mod_body
+                        };
                         SwitchCase {
                             selector,
                             body: new_body,
@@ -194,19 +210,24 @@ impl Flow {
                     .into_iter()
                     .map(|it| self.analyze_stmt(it))
                     .collect();
-                let new_default = vec![Statement::Compound(vec![
-                    self.build_assign().into(),
-                    mod_default.into(),
-                ])];
+                let new_default = if let Some(insertion) = self.build_assign() {
+                    vec![Statement::Compound(vec![
+                        insertion.into(),
+                        mod_default.into(),
+                    ])]
+                } else {
+                    mod_default
+                };
                 SwitchStatement::new(selector, new_cases, new_default).into()
             }
             Statement::ForLoop(ForLoopStatement { header, body }) => {
                 let mod_body: Vec<Statement> =
                     body.into_iter().map(|it| self.analyze_stmt(it)).collect();
-                let new_body = vec![Statement::Compound(vec![
-                    self.build_assign().into(),
-                    mod_body.into(),
-                ])];
+                let new_body = if let Some(insertion) = self.build_assign() {
+                    vec![Statement::Compound(vec![insertion.into(), mod_body.into()])]
+                } else {
+                    mod_body
+                };
                 ForLoopStatement::new(*header, new_body).into()
             }
             Statement::Continue => Statement::Continue,
