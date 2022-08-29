@@ -1,7 +1,7 @@
 pub mod cli;
 mod ub;
 
-use ast::types::{DataType, MemoryViewType, ScalarType};
+use ast::types::{DataType, ScalarType};
 use ast::*;
 use std::rc::Rc;
 use ub::generate_ub;
@@ -15,8 +15,6 @@ pub struct Options {
 }
 
 pub fn insert_ub(mut ast: Module, flow: Vec<u32>, size: usize) -> Module {
-    let mut inserter = UBInserter::new(Options { blocks: flow });
-
     let ub_struct = StructDecl::new(
         "_WGSLSmithUB",
         vec![
@@ -33,12 +31,7 @@ pub fn insert_ub(mut ast: Module, flow: Vec<u32>, size: usize) -> Module {
             StructMember::new(
                 vec![],
                 "write_value".to_string(),
-                DataType::Scalar(ScalarType::U32),
-            ),
-            StructMember::new(
-                vec![],
-                "arr".to_string(),
-                DataType::Array(Rc::new(DataType::Scalar(ScalarType::U32)), Some((size / 4) as u32)),
+                DataType::Vector(4, ScalarType::U32),
             ),
         ],
     );
@@ -65,14 +58,36 @@ pub fn insert_ub(mut ast: Module, flow: Vec<u32>, size: usize) -> Module {
             GlobalVarAttr::Binding(max_binding + 1),
         ],
         qualifier: Some(VarQualifier {
+            storage_class: StorageClass::Uniform,
+            access_mode: None,
+        }),
+        name: "_wgslsmith_ub".to_string(),
+        data_type: DataType::Struct(ub_struct.clone()),
+        initializer: None,
+    });
+    let ub_arr_type = DataType::Array(
+        Rc::new(DataType::Vector(4, ScalarType::U32)),
+        Some((size / 16) as u32),
+    );
+    ast.vars.push(GlobalVarDecl {
+        attrs: vec![
+            GlobalVarAttr::Group(0),
+            GlobalVarAttr::Binding(max_binding + 2),
+        ],
+        qualifier: Some(VarQualifier {
             storage_class: StorageClass::Storage,
             access_mode: Some(AccessMode::ReadWrite),
         }),
-        name: "_wgslsmith_ub".to_string(),
-        data_type: DataType::Struct(ub_struct),
+        name: "_wgslsmith_ub_arr".to_string(),
+        data_type: ub_arr_type.clone(),
         initializer: None,
     });
 
+    let mut inserter = UBInserter::new(
+        Options { blocks: flow },
+        ub_struct.clone(),
+        ub_arr_type.clone(),
+    );
     ast.functions = ast
         .functions
         .into_iter()
@@ -88,13 +103,17 @@ pub fn insert_ub(mut ast: Module, flow: Vec<u32>, size: usize) -> Module {
 struct UBInserter {
     block_count: u32,
     blocks: Vec<u32>,
+    ub_struct: Rc<StructDecl>,
+    arr_type: DataType,
 }
 
 impl UBInserter {
-    fn new(options: Options) -> UBInserter {
+    fn new(options: Options, ub_struct: Rc<StructDecl>, arr_type: DataType) -> UBInserter {
         UBInserter {
             block_count: 0,
             blocks: options.blocks,
+            ub_struct,
+            arr_type,
         }
     }
 
@@ -104,7 +123,7 @@ impl UBInserter {
             return None;
         }
         self.block_count += 1;
-        Some(generate_ub().into())
+        Some(generate_ub(self.ub_struct.clone(), self.arr_type.clone()).into())
     }
 
     fn analyze_fn(&mut self, mut decl: FnDecl) -> FnDecl {
